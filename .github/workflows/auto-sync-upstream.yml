@@ -1,0 +1,187 @@
+name: Auto Sync Upstream
+
+on:
+  # 定时执行 - 每天凌晨2点 (UTC)
+  schedule:
+    - cron: '0 2 * * *'
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      create_pr:
+        description: '是否创建Pull Request'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+  # 可以在有新的上游release时触发 (需要配置)
+  # repository_dispatch:
+  #   types: [upstream-update]
+
+jobs:
+  sync:
+    name: Sync Upstream Repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史,用于比较
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+      - name: Check for upstream changes
+        id: check_changes
+        run: |
+          # 检查upstream remote是否存在
+          if ! git remote | grep -q "upstream"; then
+            echo "upstream not found"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 获取上游更新
+          git fetch upstream
+
+          # 检查是否有新提交
+          if git log HEAD..upstream/main --oneline | grep -q .; then
+            echo "Found upstream changes"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            git log HEAD..upstream/main --oneline > upstream_commits.txt
+            echo "commits=$(git log HEAD..upstream/main --oneline | wc -l)" >> $GITHUB_OUTPUT
+          else
+            echo "No new upstream changes"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Show upstream changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          echo "=== 发现 ${{ steps.check_changes.outputs.commits }} 个新提交 ==="
+          cat upstream_commits.txt
+
+      - name: Create sync branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          SYNC_BRANCH="sync/$(date +%Y%m%d-%H%M%S)"
+          echo "sync_branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+          git checkout -b "$SYNC_BRANCH"
+        id: create_branch
+
+      - name: Merge upstream changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          # 合并上游变更
+          git merge upstream/main -m "Merge upstream changes"
+
+          # 如果有冲突,失败并通知
+          if git status | grep -q "both modified"; then
+            echo "ERROR: Merge conflicts detected"
+            git status
+            exit 1
+          fi
+
+          echo "Successfully merged upstream"
+
+      - name: Restore protected files
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          # 如果这些文件在主分支存在,恢复它们
+          PROTECTED_FILES=(
+            "CLAUDE.md"
+            "CODEBUDDY.md"
+            "CLAUDE_ZH.md"
+            ".sync_timestamp"
+            "scripts/sync_docs.sh"
+            "scripts/watch_and_sync.sh"
+            "scripts/hybrid_sync.py"
+          )
+
+          for file in "${PROTECTED_FILES[@]}"; do
+            if git show main:"$file" >/dev/null 2>&1; then
+              git checkout main -- "$file"
+              echo "Restored: $file"
+            fi
+          done
+
+      - name: Commit sync changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git add -A
+          git commit -m "chore: sync upstream changes on $(date +%Y-%m-%d)" || echo "No changes to commit"
+
+      - name: Push sync branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git push -u origin "${{ steps.create_branch.outputs.sync_branch }}"
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true' && github.event.inputs.create_pr != 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "🔄 Sync Upstream - $(date +'%Y-%m-%d')"
+          body: |
+            ## 🚀 Automated Upstream Sync
+
+            This PR automatically syncs changes from the upstream repository.
+
+            ### 📊 Sync Details
+            - **Upstream**: Zie619/n8n-workflows
+            - **Sync Branch**: `${{ steps.create_branch.outputs.sync_branch }}`
+            - **Base Branch**: main
+            - **Sync Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+            ### 📝 Changes Summary
+            ${{ steps.check_changes.outputs.commits }} new commits from upstream.
+
+            ### 🔒 Protected Files
+            The following files have been preserved from local changes:
+            - CLAUDE.md
+            - CODEBUDDY.md
+            - CLAUDE_ZH.md
+            - .sync_timestamp
+            - scripts/sync_docs.sh
+            - scripts/watch_and_sync.sh
+            - scripts/hybrid_sync.py
+
+            ### ✅ Actions Required
+            - [ ] Review the changes
+            - [ ] Test the sync
+            - [ ] Merge if everything looks good
+
+            ---
+            *Automatically created by GitHub Actions*
+          branch: "${{ steps.create_branch.outputs.sync_branch }}"
+          labels: automated, sync
+          delete-branch: true
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Sync Summary 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check_changes.outputs.has_changes }}" = "true" ]; then
+            echo "✅ **Sync completed successfully**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **New commits**: ${{ steps.check_changes.outputs.commits }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Sync branch**: `${{ steps.create_branch.outputs.sync_branch }}`" >> $GITHUB_STEP_SUMMARY
+            echo "- **PR created**: ${{ github.event.inputs.create_pr != 'false' && 'Yes' || 'No' }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ **No upstream changes to sync**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "### ❌ Sync Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The automated sync failed. Please check the logs for details." >> $GITHUB_STEP_SUMMARY
